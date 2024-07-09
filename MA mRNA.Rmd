@@ -1,0 +1,409 @@
+---
+title: "MA mRNA"
+author: "Gabriel"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+#Pacotes
+```{r}
+library(AnnotationDbi)
+library(dendextend)
+library(EnhancedVolcano)
+library(FactoMineR); library(factoextra)
+library(hugene20sttranscriptcluster.db)
+library(pd.hugene.2.0.st)
+library(GEOquery)
+library(limma)
+library(oligo)
+library(pheatmap)
+library(sva)
+library(tidyverse)
+library(affycoretools)
+
+### Pacotes
+library(reshape2)
+library(clusterProfiler)
+library(dendextend)
+library(DESeq2)
+library(enrichplot)
+library(fgsea)
+library(GOplot)
+library(ggpubr)
+library(msigdbr)
+library(openxlsx)
+library(org.Hs.eg.db)
+library(pheatmap)
+library(UpSetR)
+library(rstatix)
+library(tidyverse)
+library(WGCNA)
+library(usethis)
+
+```
+
+#Carregar dados
+
+```{r}
+#GSE130563
+gse130563 <- getGEO("GSE130563")
+gse <- gse130563[[1]]
+
+#Download dos dados suplementares, arquivos .cel
+filePaths <- getGEOSuppFiles("GSE130563")
+pd <- pData(gse)
+
+pd['cel_file'] <- str_split(pd$supplementary_file,"/") %>% map_chr(tail,1) #Criar nova coluna (cel_file) contendo o nome do arquivo de cada leitura. Importante para manter a ordem das leituras ao importar os dados de leitura
+
+#Importar com a ordem correta, garantindo que as leituras estao mapeadas para as amostras certas
+gse_celdata <-  read.celfiles(paste0('GSE130563/GSE130563_RAW/',pd$cel_file),phenoData=phenoData(gse))
+```
+
+#Seleção de dados 1
+```{r}
+#Selecionar amostras de interesse
+pd_selected <- pd[17:38,]
+pd_selected <- pd_selected %>% mutate(Grupo = ifelse(grepl("^C", title), 'Cachexia', 'Non_cachexia'))
+gse_selected <- gse_celdata[,rownames(pd_selected)]
+
+eset <- rma(gse_selected)
+eset <- annotateEset(eset, pd.hugene.2.0.st)
+
+```
+
+
+#Remover Genes sem mapeamento e probes duplicadas
+```{r}
+fd_gse <- fData(eset)
+colnames(fd_gse)
+anno_gse <- AnnotationDbi::select(hugene20sttranscriptcluster.db,
+                                  keys=(featureNames(eset)),
+                                  columns = c('SYMBOL', 'GENENAME', 'ENTREZID'),
+                                  keytype = 'PROBEID')
+anno_gse <- subset(anno_gse, !is.na(SYMBOL))
+
+anno_grouped <- group_by(anno_gse, PROBEID)
+anno_summarized <-dplyr::summarize(anno_grouped, no_of_matches = n_distinct(SYMBOL))
+anno_filtered <- filter(anno_summarized, no_of_matches > 1)
+probe_stats <- anno_filtered
+dim(probe_stats)
+
+ids_to_exlude <- (featureNames(eset) %in% probe_stats$PROBEID)
+ids_symbol_na <- featureNames(eset) %in% anno_gse$PROBEID
+table(ids_to_exlude)
+table(ids_symbol_na)
+
+gse_final <- subset(eset, !ids_to_exlude)
+gse_final <- subset(eset, ids_symbol_na)
+
+fData(gse_final)$PROBEID <- rownames(fData(gse_final))
+
+fData(gse_final) <- left_join(fData(gse_final), anno_gse)
+
+
+fData(gse_final)
+
+
+exp_gse <- exprs(gse_final)
+
+oligo::hist(exp_gse)
+oligo::hist(gse_final)
+```
+
+
+#Filtros 1
+##Filtro.1.1 - Baixas leituras
+```{r}
+gse_medians <- rowMedians(exp_gse)
+
+hist(gse_medians, 100, freq=F, col='cornsilk') 
+abline(v=1.2)
+
+threshold <- apply(gse_final, 1, function(x) {
+  sum(x > 1.2) >= 5 })
+
+table(threshold)
+
+eset_filtered <- subset(gse_final, threshold)
+exp_filtered <- exprs(eset_filtered)
+
+oligo::hist(eset_filtered)
+```
+
+##Filtro.1.2 - Dendograma e PCA
+```{r}
+ann <- dplyr::select(pd_selected, Grupo)
+cores <- c('yellow', 'blue')
+dist <- dist(t(exp_filtered))
+hc <- hclust(dist)
+dend <- as.dendrogram(hc)
+
+dend %>% 
+  color_labels(labels = colnames(exp_filtered[,1:17]), col="blue") %>%
+  color_labels(labels = colnames(exp_filtered[,18:22]), col="yellow") %>%
+  plot()
+
+  legend("topright",
+       legend=c('Cachexia', 'Non-cachexia'),
+       col=c('blue', 'yellow'),
+       pch=c(20,20,20), bty = "n", pt.cex = 1.8, cex = .8, trace=T)
+
+  
+  
+pca <- PCA(t(exp_filtered), graph = F)
+
+fviz_pca_ind(pca,
+             mean.point=F,
+             geom.ind='point', pointshape=21,
+             fill.ind=pd_selected$Grupo,
+             addEllipses = T, ellipse.type='confidence')+
+    scale_fill_manual(values=c("blue", "yellow"))+
+  scale_color_manual(values=c("blue", "yellow"))
+```
+
+
+#Filtros 2
+
+#Remover amostras distantes
+```{r}
+#Remover 'GSM3743577', 'GSM3743573', 'GSM3743592'
+which(rownames(pd_selected) %in% c('GSM3743577', 'GSM3743573', 'GSM3743592'))
+pd_selected.2 <- pd_selected[-c(3,7,22),]
+pd_selected.2$Grupo <- factor(pd_selected.2$Grupo, levels=c('Non_cachexia', 'Cachexia'))
+levels(pd_selected.2$Grupo)
+
+
+gse_selected <- gse_celdata[,rownames(pd_selected.2)]
+
+eset <- rma(gse_selected)
+eset <- annotateEset(eset, pd.hugene.2.0.st)
+
+```
+
+#Remover Genes sem mapeamento e probes duplicadas
+```{r}
+fd_gse <- fData(eset)
+colnames(fd_gse)
+anno_gse <- AnnotationDbi::select(hugene20sttranscriptcluster.db,
+                                  keys=(featureNames(eset)),
+                                  columns = c('SYMBOL', 'GENENAME', 'ENTREZID'),
+                                  keytype = 'PROBEID')
+anno_gse <- subset(anno_gse, !is.na(SYMBOL))
+
+anno_grouped <- group_by(anno_gse, PROBEID)
+anno_summarized <-dplyr::summarize(anno_grouped, no_of_matches = n_distinct(SYMBOL))
+anno_filtered <- filter(anno_summarized, no_of_matches > 1)
+probe_stats <- anno_filtered
+dim(probe_stats)
+
+ids_to_exlude <- (featureNames(eset) %in% probe_stats$PROBEID)
+ids_symbol_na <- featureNames(eset) %in% anno_gse$PROBEID
+table(ids_to_exlude)
+table(ids_symbol_na)
+
+gse_final <- subset(eset, !ids_to_exlude)
+gse_final <- subset(eset, ids_symbol_na)
+
+fData(gse_final)$PROBEID <- rownames(fData(gse_final))
+
+fData(gse_final) <- left_join(fData(gse_final), anno_gse)
+
+
+fData(gse_final)
+
+
+exp_gse <- exprs(gse_final)
+
+oligo::hist(exp_gse)
+oligo::hist(gse_final)
+
+oligo::boxplot(gse_final)
+oligo::boxplot(eset_filtered)
+oligo::boxplot(eset)
+```
+
+
+##Filtro.2.1 - Baixas leituras
+```{r}
+gse_medians <- rowMedians(exp_gse)
+
+hist(gse_medians, 100, freq=F, col='cornsilk') 
+abline(v=1)
+
+threshold <- apply(exp_gse, 1, function(x) {
+  sum(x > 1) >= 4 })
+
+table(threshold)
+
+eset_filtered <- subset(gse_final, threshold)
+exp_filtered <- exprs(eset_filtered)
+
+oligo::hist(eset_filtered)
+```
+
+##Filtro.2.2 - Dendograma e PCA
+```{r}
+ann <- dplyr::select(pd_selected.2, Grupo)
+cores <- c('yellow', 'blue')
+dist <- dist(t(exp_filtered))
+hc <- hclust(dist)
+dend <- as.dendrogram(hc)
+
+dend %>% 
+  color_labels(labels = colnames(exp_filtered[,1:15]), col="blue") %>%
+  color_labels(labels = colnames(exp_filtered[,16:19]), col="yellow") %>%
+  plot()
+
+  legend("topright",
+       legend=c('Cachexia', 'Non-cachexia'),
+       col=c('blue', 'yellow'),
+       pch=c(20,20,20), bty = "n", pt.cex = 1.8, cex = .8, trace=T)
+
+  
+  
+pca <- PCA(t(exp_filtered), graph = F)
+
+fviz_pca_ind(pca,
+             mean.point=F,
+             geom.ind='point', pointshape=21,
+             fill.ind=pd_selected.2$Grupo,
+             addEllipses = T, ellipse.type='confidence')+
+    scale_fill_manual(values=c("blue", "yellow"))+
+  scale_color_manual(values=c("blue", "yellow"))
+```
+
+
+#DEG
+```{r}
+design <- model.matrix(~ pd_selected.2$Grupo)
+#colnames(design) <- levels(as.factor(pd_selected.2$Grupo))
+
+#contrast_matrix <- makeContrasts(Cachexia - Non_cachexia, levels=colnames(design))
+#contrast_matrix
+
+fit <- lmFit(gse_final, design)
+#fit2 <- contrasts.fit(fit, contrasts=contrast_matrix)
+fit2 <- eBayes(fit2)
+
+topTable(fit2)
+
+summary(decideTests(fit2,lfc=2, coef=2, adjust.method = "fdr", p.value = 0.05))
+```
+
+
+#WGCNA
+##Selecionar amostras aleatoriamente
+```{r}
+cachexia <- pd_selected.2 %>% filter(Grupo == "Cachexia") %>% dplyr::select(title, Grupo)
+random_cachexia <- slice_sample(cachexia, n = 8)
+random_cachexia <- random_cachexia %>% mutate(Ordem = as.numeric(str_extract(title, '\\d+')))
+random_cachexia <- random_cachexia[order(random_cachexia$Ordem),]
+
+non_cachexia <- pd_selected.2 %>% filter(Grupo == "Non_cachexia") %>% dplyr::select(title, Grupo)
+
+pd_selected.3 <- rbind(random_cachexia[,-3], non_cachexia)
+
+
+input_mat <- t(exp_filtered[, rownames(pd_selected.3)])
+
+```
+
+```{r}
+
+
+allowWGCNAThreads()          # allow multi-threading (optional)
+#> Allowing multi-threading with up to 4 threads.
+
+# Choose a set of soft-thresholding powers
+powers = c(c(1:10), seq(from = 12, to = 20, by = 2))
+
+# Call the network topology analysis function
+sft = pickSoftThreshold(
+  input_mat,             # <= Input data
+  #blockSize = 30,
+  powerVector = powers,
+  verbose = 5
+  )
+
+par(mfrow = c(1,2));
+cex1 = 0.9;
+
+
+plot(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)",
+     ylab = "Scale Free Topology Model Fit, signed R^2",
+     main = paste("Scale independence")
+)
+text(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, cex = cex1, col = "red"
+)
+abline(h = 0.90, col = "red")
+plot(sft$fitIndices[, 1],
+     sft$fitIndices[, 5],
+     xlab = "Soft Threshold (power)",
+     ylab = "Mean Connectivity",
+     type = "n",
+     main = paste("Mean connectivity")
+)
+text(sft$fitIndices[, 1],
+     sft$fitIndices[, 5],
+     labels = powers,
+     cex = cex1, col = "red")
+
+```
+
+```{r}
+picked_power <- 8
+
+netwk <- blockwiseModules(input_mat,                # <= input here
+
+                          # == Adjacency Function ==
+                          power = picked_power,                # <= power here
+                          networkType = "signed", #diferencia entre correlacao positiva e negativa
+
+                          # == Tree and Block Options ==
+                          deepSplit = 2,
+                          pamRespectsDendro = F,
+                          # detectCutHeight = 0.75,
+                          minModuleSize = 30,
+                          maxBlockSize = 10000,
+
+                          # == Module Adjustments ==
+                          reassignThreshold = 1e-6,               # MUDOU AQUI
+                          mergeCutHeight = 0.25,
+
+                          # == TOM == Archive the run results in TOM file (saves time)
+                          saveTOMs = T,
+                          saveTOMFileBase = "ER",
+
+                          # == Output Options
+                          numericLabels = F, verbose = 5)
+
+
+netwk2 <- blockwiseModules(input_mat,                # <= input here
+
+                          # == Adjacency Function ==
+                          power = 7,                # <= power here
+                          networkType = "signed", #diferencia entre correlacao positiva e negativa
+
+                          # == Tree and Block Options ==
+                          deepSplit = 2,
+                          pamRespectsDendro = F,
+                          # detectCutHeight = 0.75,
+                          minModuleSize = 60,
+                          maxBlockSize = 15000,
+
+                          # == Module Adjustments ==
+                          reassignThreshold = 1e-6,               # MUDOU AQUI
+                          mergeCutHeight = 0.25,
+
+                          # == TOM == Archive the run results in TOM file (saves time)
+                          saveTOMs = T,
+                          saveTOMFileBase = "ER",
+
+                          # == Output Options
+                          numericLabels = F, verbose = 3)
+```
+
